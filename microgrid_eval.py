@@ -1,102 +1,210 @@
+"""Reproducible 24-hour microgrid dispatch benchmark.
+
+The report's headline values are recorded as reference results, but this module
+computes its displayed results from dispatch policies and simulated profiles.
+The included heuristic policies are not a trained MADRL implementation.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Protocol
+
 import numpy as np
 import pandas as pd
 
-# ==========================================
-# 1. Microgrid Environment Setup
-# ==========================================
+
+@dataclass(frozen=True)
+class MicrogridConfig:
+    solar_capacity_kw: float = 60.0
+    battery_capacity_kwh: float = 100.0
+    battery_power_limit_kw: float = 25.0
+    dt_hours: float = 0.25
+    timesteps: int = 96
+    soc_min: float = 0.20
+    soc_max: float = 0.90
+    initial_soc: float = 0.50
+    charge_efficiency: float = 0.95
+    discharge_efficiency: float = 0.95
+    random_seed: int = 42
+
+
+@dataclass(frozen=True)
+class DispatchAction:
+    """Battery power is positive while charging; shift_kw reduces net load."""
+
+    battery_kw: float = 0.0
+    shift_kw: float = 0.0
+
+
+class Controller(Protocol):
+    name: str
+
+    def act(
+        self, index: int, time_hours: float, solar_kw: float, load_kw: float,
+        tariff_per_kwh: float, soc: float, config: MicrogridConfig,
+    ) -> DispatchAction: ...
+
+
 class MicrogridEnv:
-    def __init__(self):
-        # System Parameters based on the report
-        self.solar_capacity = 60.0  # kW
-        self.battery_capacity = 100.0  # kWh
-        self.dt = 0.25  # 15-minute intervals (1/4 hour)
-        self.timesteps = 96  # 24 hours * 4 intervals/hour
-        
-        # Safe operating limits
-        self.soc_min = 0.20
-        self.soc_max = 0.90
-        
-    def generate_daily_profiles(self):
-        """Generates synthetic 24-hour curves for Solar, Load, and Grid Tariff."""
-        time = np.linspace(0, 24, self.timesteps)
-        
-        # Tariff: High in the evening (6 PM - 10 PM), cheaper otherwise
-        tariff = np.where((time >= 18) & (time <= 22), 0.35, 0.15) # $/kWh
-        
-        # Solar: Bell curve peaking at noon
-        solar = self.solar_capacity * np.exp(-0.5 * ((time - 12) / 2.5)**2)
-        
-        # Load: Base load with evening peak
-        load = 20 + 25 * np.exp(-0.5 * ((time - 19) / 2)**2) + 10 * np.random.rand(self.timesteps)
-        
+    """Simple grid-connected microgrid with a 15-minute dispatch interval."""
+
+    def __init__(self, config: MicrogridConfig | None = None):
+        self.config = config or MicrogridConfig()
+
+    def generate_daily_profiles(self) -> tuple[np.ndarray, ...]:
+        """Return deterministic time, solar, load and tariff arrays."""
+        cfg = self.config
+        time = np.arange(cfg.timesteps, dtype=float) * cfg.dt_hours
+        tariff = np.where((time >= 18.0) & (time < 22.0), 0.35, 0.15)
+        solar = cfg.solar_capacity_kw * np.exp(-0.5 * ((time - 12.0) / 2.5) ** 2)
+        rng = np.random.default_rng(cfg.random_seed)
+        load = 20.0 + 25.0 * np.exp(-0.5 * ((time - 19.0) / 2.0) ** 2)
+        load += 10.0 * rng.random(cfg.timesteps)
         return time, solar, load, tariff
 
-    def step(self, p_load, p_solar, p_bat, p_gen, p_shift, tariff, soc):
-        """Calculates power balance and costs for a single 15-minute step."""
-        # Equation 1: Power Balance Rule
-        p_grid = (p_load - p_shift) + p_bat - p_solar - p_gen
-        
-        # Prevent negative grid power (selling back to grid is assumed 0 profit for simplicity)
-        p_grid = max(0, p_grid) 
-        
-        # Equation 3: Step Electricity Cost
-        step_cost = (tariff * p_grid * self.dt)
-        
-        # Equation 2: Battery Charge (SoC) Update
-        soc_new = soc + ((p_bat * self.dt) / self.battery_capacity)
-        
-        return p_grid, step_cost, soc_new
+    def run(self, controller: Controller) -> dict[str, float | str | int]:
+        cfg = self.config
+        time, solar, load, tariff = self.generate_daily_profiles()
+        soc = cfg.initial_soc
+        total_cost = 0.0
+        peak_grid_kw = 0.0
+        violations = 0
+        shifted_energy_kwh = 0.0
 
-# ==========================================
-# 2. Control Strategies (Evaluation Profiles)
-# ==========================================
-def evaluate_strategies():
+        for i in range(cfg.timesteps):
+            action = controller.act(i, time[i], solar[i], load[i], tariff[i], soc, cfg)
+            requested_battery = float(action.battery_kw)
+            requested_shift = float(action.shift_kw)
+
+            # Count requested battery operation that breaches power or SoC limits.
+            if abs(requested_battery) > cfg.battery_power_limit_kw + 1e-9:
+                violations += 1
+            battery_kw = float(np.clip(
+                requested_battery, -cfg.battery_power_limit_kw, cfg.battery_power_limit_kw
+            ))
+            energy_delta = self._soc_energy_delta(battery_kw, cfg)
+            proposed_soc = soc + energy_delta / cfg.battery_capacity_kwh
+            if proposed_soc < cfg.soc_min - 1e-9 or proposed_soc > cfg.soc_max + 1e-9:
+                violations += 1
+                # Enforce physical limits while counting the policy's violation.
+                bounded_soc = float(np.clip(proposed_soc, cfg.soc_min, cfg.soc_max))
+                energy_delta = (bounded_soc - soc) * cfg.battery_capacity_kwh
+                battery_kw = self._power_for_soc_delta(energy_delta, cfg)
+                proposed_soc = bounded_soc
+
+            net_load_kw = max(0.0, load[i] - requested_shift)
+            grid_kw = max(0.0, net_load_kw + battery_kw - solar[i])
+            total_cost += tariff[i] * grid_kw * cfg.dt_hours
+            peak_grid_kw = max(peak_grid_kw, grid_kw)
+            shifted_energy_kwh += requested_shift * cfg.dt_hours
+            soc = proposed_soc
+
+        return {
+            "Control method": controller.name,
+            "Daily operating cost ($)": total_cost,
+            "Battery limit violations": violations,
+            "Peak grid power (kW)": peak_grid_kw,
+            "Final state of charge": soc,
+            "Net load shifted (kWh)": shifted_energy_kwh,
+        }
+
+    @staticmethod
+    def _soc_energy_delta(power_kw: float, cfg: MicrogridConfig) -> float:
+        if power_kw >= 0:
+            return power_kw * cfg.dt_hours * cfg.charge_efficiency
+        return power_kw * cfg.dt_hours / cfg.discharge_efficiency
+
+    @staticmethod
+    def _power_for_soc_delta(energy_delta_kwh: float, cfg: MicrogridConfig) -> float:
+        if energy_delta_kwh >= 0:
+            return energy_delta_kwh / (cfg.dt_hours * cfg.charge_efficiency)
+        return energy_delta_kwh * cfg.discharge_efficiency / cfg.dt_hours
+
+
+class RuleBasedController:
+    name = "Standard Rule-Based Control"
+
+    def act(self, index, time_hours, solar_kw, load_kw, tariff_per_kwh, soc, config):
+        surplus = solar_kw - load_kw
+        if surplus > 0 and soc < config.soc_max:
+            battery_kw = min(surplus, config.battery_power_limit_kw)
+        elif surplus < 0 and soc > config.soc_min:
+            battery_kw = -min(-surplus, config.battery_power_limit_kw)
+        else:
+            battery_kw = 0.0
+        return DispatchAction(battery_kw=battery_kw)
+
+
+class UncoordinatedController:
+    """Independent price-following battery and evening-load heuristics."""
+
+    name = "Uncoordinated RL (No Coach Critic)"
+
+    def act(self, index, time_hours, solar_kw, load_kw, tariff_per_kwh, soc, config):
+        # The independent battery heuristic responds to tariff but does not
+        # forecast the evening demand or coordinate with load shifting.
+        if tariff_per_kwh >= 0.35 and soc > config.soc_min:
+            battery_kw = -22.0
+        elif tariff_per_kwh <= 0.15 and soc < config.soc_max and solar_kw < load_kw:
+            battery_kw = 12.0
+        else:
+            battery_kw = 0.0
+        shift_kw = 3.0 if 18.0 <= time_hours < 22.0 else 0.0
+        return DispatchAction(battery_kw=battery_kw, shift_kw=shift_kw)
+
+
+class CoordinatedController:
+    """Coordinated heuristic for solar charging, peak discharge and load shifting."""
+
+    name = "Coordinated Multi-Agent Strategy (MADRL-style heuristic)"
+
+    def act(self, index, time_hours, solar_kw, load_kw, tariff_per_kwh, soc, config):
+        solar_surplus = solar_kw - load_kw
+        if solar_surplus > 2.0 and soc < config.soc_max:
+            battery_kw = min(solar_surplus, config.battery_power_limit_kw)
+        elif tariff_per_kwh >= 0.35 and soc > config.soc_min + 0.03:
+            battery_kw = -config.battery_power_limit_kw
+        elif tariff_per_kwh <= 0.15 and soc < 0.45 and solar_kw < load_kw:
+            battery_kw = 8.0
+        else:
+            battery_kw = 0.0
+
+        # Move a matching amount of demand from the evening peak into the
+        # solar-rich midday window; positive shift reduces load at that time.
+        if 11.0 <= time_hours < 15.0:
+            shift_kw = -3.0
+        elif 18.0 <= time_hours < 22.0:
+            shift_kw = 3.0
+        else:
+            shift_kw = 0.0
+        return DispatchAction(battery_kw=battery_kw, shift_kw=shift_kw)
+
+
+REPORT_REFERENCE_RESULTS = pd.DataFrame([
+    ["Standard Rule-Based Control", 48.60, 0, 54.2],
+    ["Uncoordinated RL (No Coach Critic)", 43.10, 4, 44.8],
+    ["Proposed Multi-Agent RL (MADRL)", 39.65, 0, 36.5],
+], columns=["Control method", "Daily operating cost ($)",
+            "Battery limit violations", "Peak grid power (kW)"])
+
+
+def evaluate_strategies() -> pd.DataFrame:
+    """Run the three executable baseline policies and return computed metrics."""
     env = MicrogridEnv()
-    time, solar, load, tariff = env.generate_daily_profiles()
-    
-    # Target Results from Table 1
-    # Rule-Based: $48.60, 54.2 kW, 0 violations
-    # Uncoordinated RL: $43.10, 44.8 kW, 4 violations
-    # MADRL: $39.65, 36.5 kW, 0 violations
-    
-    results = []
-    
-    # 1. Standard Rule-Based Control (Baseline)
-    # Simple logic: charge if solar > load, discharge if load > solar
-    cost_rule = 48.60
-    peak_rule = 54.2
-    viol_rule = 0
-    results.append(["Standard Rule-Based Control", f"${cost_rule:.2f}", viol_rule, f"{peak_rule} kW"])
+    controllers = [RuleBasedController(), UncoordinatedController(), CoordinatedController()]
+    return pd.DataFrame(env.run(controller) for controller in controllers)
 
-    # 2. Uncoordinated RL (No Coach Critic)
-    # Agents clash, resulting in some limits being broken
-    cost_uncoord = 43.10
-    peak_uncoord = 44.8
-    viol_uncoord = 4
-    results.append(["Uncoordinated RL (No Coach Critic)", f"${cost_uncoord:.2f} (11.3% saved)", viol_uncoord, f"{peak_uncoord} kW"])
 
-    # 3. Proposed Multi-Agent RL (MADRL)
-    # Coach critic ensures perfect coordination (Load shifting + Battery timing)
-    cost_madrl = 39.65
-    peak_madrl = 36.5
-    viol_madrl = 0
-    results.append(["Proposed Multi-Agent RL (MADRL)", f"${cost_madrl:.2f} (18.4% saved)", viol_madrl, f"{peak_madrl} kW"])
+def main() -> None:
+    print("\nMADRL MICROGRID ENERGY MANAGEMENT — 24-HOUR SIMULATION")
+    print("System: 60 kW solar | 100 kWh battery | 15-minute intervals")
+    print("Computed results (not hard-coded report outcomes):")
+    print(evaluate_strategies().to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+    print("\nReport reference results for comparison:")
+    print(REPORT_REFERENCE_RESULTS.to_string(index=False, float_format=lambda x: f"{x:.2f}"))
+    print("\nNote: MADRL-style policy here is a transparent heuristic, not a trained agent.")
 
-    # ==========================================
-    # 3. Display Results Output
-    # ==========================================
-    print("\n" + "="*80)
-    print("   MADRL MICROGRID ENERGY MANAGEMENT SYSTEM - 24 HOUR EVALUATION   ")
-    print("   Parameters: 60 kW Solar Array | 100 kWh Battery Bank            ")
-    print("="*80)
-    
-    df = pd.DataFrame(results, columns=["Control Method", "Daily Operating Cost", "Battery Limit Violations", "Peak Grid Power Drawn"])
-    print(df.to_string(index=False))
-    print("="*80 + "\n")
-    
-    print("[INFO] Simulation complete.")
-    print("[INFO] Battery Agent successfully learned to store excess solar (10 AM - 4 PM).")
-    print("[INFO] Smart Load Agent successfully shifted evening peaks.")
 
 if __name__ == "__main__":
-    evaluate_strategies()
+    main()
